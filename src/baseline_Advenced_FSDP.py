@@ -14,40 +14,42 @@ from torchvision import transforms
 from tqdm import tqdm
 import torch.multiprocessing as mp
 import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+from torch.distributed.fsdp import MixedPrecision
+from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 
-# Suppress warnings for better log readability
+# 경고 제거로 로그 가독성 향상
 warnings.filterwarnings("ignore")
 
-# Configuration
+# 설정
 CFG = {
     'EPOCHS': 100,
     'LEARNING_RATE': 3e-4,
     'BATCH_SIZE': 32,
     'SEED': 42,
-    'WORLD_SIZE': torch.cuda.device_count(),  # Number of GPUs available
+    'WORLD_SIZE': torch.cuda.device_count(),  # 사용 가능한 GPU 수
     'NUM_WORKERS': 4,
     'PATIENCE': 10
 }
 
-# Seed setting
+# 시드 설정
 def seed_everything(seed):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # Deterministic algorithms can have performance implications
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # FSDP에서는 결정적 동작이 성능에 영향을 줄 수 있으므로 비활성화
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
 
-seed_everything(CFG['SEED'])
-
-# Data directories
+# 데이터 디렉토리
 origin_dir = './data/train_gt'
 damage_dir = './data/train_input'
 test_dir = './data/test_input'
 
-# Custom dataset with consistent transformations
+# 일관된 변환을 가진 커스텀 데이터셋
 class CustomDataset(Dataset):
     def __init__(self, damage_dir, origin_dir, transform=None):
         self.damage_dir = damage_dir
@@ -57,7 +59,7 @@ class CustomDataset(Dataset):
         self.origin_files = sorted(os.listdir(origin_dir))
 
         assert len(self.damage_files) == len(self.origin_files), \
-            "The number of images in damage and origin folders must match"
+            "손상된 이미지와 원본 이미지의 수가 일치해야 합니다."
 
     def __len__(self):
         return len(self.damage_files)
@@ -73,7 +75,7 @@ class CustomDataset(Dataset):
         origin_img = Image.open(origin_img_path).convert("RGB")
 
         if self.transform:
-            # Apply the same transformation to both images
+            # 두 이미지에 동일한 변환 적용
             seed = np.random.randint(2147483647)
             random.seed(seed)
             torch.manual_seed(seed)
@@ -84,7 +86,7 @@ class CustomDataset(Dataset):
 
         return {'A': damage_img, 'B': origin_img}
 
-# Data transformations
+# 데이터 변환
 transform = transforms.Compose([
     transforms.Resize((256, 256)),
     transforms.RandomHorizontalFlip(),
@@ -93,19 +95,23 @@ transform = transforms.Compose([
 ])
 
 def main():
-    # Spawn processes
+    # FSDP를 위한 환경 변수 설정
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+
+    # 프로세스 생성
     mp.spawn(train, args=(CFG['WORLD_SIZE'],), nprocs=CFG['WORLD_SIZE'], join=True)
 
 def train(rank, world_size):
-    # Initialize the process group
+    # 프로세스 그룹 초기화
     dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
     torch.cuda.set_device(rank)
     device = torch.device(f'cuda:{rank}')
 
-    # Seed everything
-    seed_everything(CFG['SEED'] + rank)  # Ensure each process has a different seed
+    # 시드 설정
+    seed_everything(CFG['SEED'] + rank)  # 각 프로세스마다 다른 시드 사용
 
-    # Create dataset and split into train and validation sets
+    # 데이터셋 생성 및 학습/검증 세트로 분할
     full_dataset = CustomDataset(damage_dir=damage_dir, origin_dir=origin_dir, transform=transform)
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
@@ -114,7 +120,7 @@ def train(rank, world_size):
         generator=torch.Generator().manual_seed(CFG['SEED'])
     )
 
-    # Use DistributedSampler
+    # DistributedSampler 사용
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
 
@@ -147,7 +153,7 @@ def train(rank, world_size):
                     layers.append(nn.Dropout(dropout))
                 return nn.Sequential(*layers)
 
-            # Define the layers of the generator
+            # Generator의 레이어 정의
             self.down1 = down_block(in_channels, 64, normalize=False)
             self.down2 = down_block(64, 128)
             self.down3 = down_block(128, 256)
@@ -204,7 +210,7 @@ def train(rank, world_size):
                 layers.append(nn.LeakyReLU(0.2, inplace=True))
                 return nn.Sequential(*layers)
 
-            # Define the layers of the discriminator
+            # Discriminator의 레이어 정의
             self.model = nn.Sequential(
                 discriminator_block(in_channels * 2, 64, normalization=False),
                 discriminator_block(64, 128),
@@ -217,7 +223,7 @@ def train(rank, world_size):
             img_input = torch.cat((img_A, img_B), 1)
             return self.model(img_input)
 
-    # Initialize models, optimizers, and loss functions
+    # 모델 초기화 및 손실 함수 정의
     def weights_init_normal(m):
         classname = m.__class__.__name__
         if classname.find('Conv') != -1:
@@ -232,13 +238,27 @@ def train(rank, world_size):
     generator.apply(weights_init_normal)
     discriminator.apply(weights_init_normal)
 
-    # Wrap models with DistributedDataParallel
-    generator = nn.parallel.DistributedDataParallel(generator, device_ids=[rank])
-    discriminator = nn.parallel.DistributedDataParallel(discriminator, device_ids=[rank])
+    # FSDP로 모델 래핑
+    fsdp_policy = size_based_auto_wrap_policy
+    fsdp_kwargs = dict(
+        auto_wrap_policy=fsdp_policy,
+        mixed_precision=MixedPrecision(
+            param_dtype=torch.float16,    # 파라미터를 fp16으로
+            reduce_dtype=torch.float16,   # reduce를 fp16으로
+            buffer_dtype=torch.float16    # 버퍼를 fp16으로
+        ),
+        device_id=torch.cuda.current_device(),
+        forward_prefetch=True
+    )
 
+    generator = FSDP(generator, **fsdp_kwargs)
+    discriminator = FSDP(discriminator, **fsdp_kwargs)
+
+    # 손실 함수 정의
     criterion_GAN = nn.MSELoss().to(device)
     criterion_pixelwise = nn.L1Loss().to(device)
 
+    # 옵티마이저
     optimizer_G = optim.Adam(
         generator.parameters(), lr=CFG["LEARNING_RATE"], betas=(0.5, 0.999)
     )
@@ -246,7 +266,7 @@ def train(rank, world_size):
         discriminator.parameters(), lr=CFG["LEARNING_RATE"], betas=(0.5, 0.999)
     )
 
-    # Learning rate schedulers
+    # 학습률 스케줄러
     scheduler_G = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer_G, mode='min', factor=0.5, patience=5, verbose=(rank == 0)
     )
@@ -254,27 +274,26 @@ def train(rank, world_size):
         optimizer_D, mode='min', factor=0.5, patience=5, verbose=(rank == 0)
     )
 
-    # Early stopping parameters
+    # 조기 종료 설정
     early_stopping_patience = CFG['PATIENCE']
     epochs_without_improvement = 0
 
-    # Mixed precision scaler
-    scaler_G = torch.cuda.amp.GradScaler()
-    scaler_D = torch.cuda.amp.GradScaler()
+    # 혼합 정밀도 스케일러
+    scaler_G = ShardedGradScaler()
+    scaler_D = ShardedGradScaler()
 
-    # Training loop with validation
+    # 학습 루프 및 검증
     best_val_loss = float("inf")
     lambda_pixel = 100
 
     for epoch in range(1, CFG['EPOCHS'] + 1):
         if epochs_without_improvement >= early_stopping_patience:
             if rank == 0:
-                print("Early stopping triggered.")
+                print("조기 종료가 발동되었습니다.")
             break
 
-        # Set samplers epoch for shuffling
+        # 에포크마다 샘플러 설정
         train_sampler.set_epoch(epoch)
-        val_sampler.set_epoch(epoch)  # Not strictly necessary for val_sampler
 
         generator.train()
         discriminator.train()
@@ -291,7 +310,7 @@ def train(rank, world_size):
             real_B = batch['B'].to(device, non_blocking=True)
 
             # ------------------
-            #  Train Generator
+            #  Generator 학습
             # ------------------
             optimizer_G.zero_grad()
             with torch.cuda.amp.autocast():
@@ -307,7 +326,7 @@ def train(rank, world_size):
             scaler_G.update()
 
             # ---------------------
-            #  Train Discriminator
+            #  Discriminator 학습
             # ---------------------
             optimizer_D.zero_grad()
             with torch.cuda.amp.autocast():
@@ -329,14 +348,14 @@ def train(rank, world_size):
             total_D_loss += loss_D.item()
 
             if rank == 0:
-                # Update progress bar
+                # 진행 상황 업데이트
                 train_bar.set_postfix({
                     'Batch': f'{i}/{len(train_loader)}',
                     'D_loss': f'{loss_D.item():.4f}',
                     'G_loss': f'{loss_G.item():.4f}'
                 })
 
-        # Average the losses across all processes
+        # 모든 프로세스에서 손실 평균화
         total_G_loss_tensor = torch.tensor(total_G_loss, device=device)
         total_D_loss_tensor = torch.tensor(total_D_loss, device=device)
 
@@ -346,7 +365,7 @@ def train(rank, world_size):
         avg_G_loss = total_G_loss_tensor.item() / (len(train_loader) * world_size)
         avg_D_loss = total_D_loss_tensor.item() / (len(train_loader) * world_size)
 
-        # Gather validation loss from all processes
+        # 검증
         generator.eval()
         val_loss = 0
         with torch.no_grad():
@@ -359,7 +378,7 @@ def train(rank, world_size):
                     loss_pixel = criterion_pixelwise(fake_B, real_B)
                 val_loss += loss_pixel.item()
 
-        # Reduce val_loss across all processes
+        # 모든 프로세스에서 검증 손실 집계
         val_loss_tensor = torch.tensor(val_loss, device=device)
         dist.reduce(val_loss_tensor, dst=0, op=dist.ReduceOp.SUM)
         total_val_loss = val_loss_tensor.item()
@@ -370,47 +389,60 @@ def train(rank, world_size):
                   f"Generator Loss: {avg_G_loss:.4f}, Discriminator Loss: {avg_D_loss:.4f}")
             print(f"Validation Loss: {val_loss_avg:.4f}")
 
-            # Step schedulers
+            # 스케줄러 스텝
             scheduler_G.step(val_loss_avg)
             scheduler_D.step(val_loss_avg)
 
-            # Early stopping
+            # 조기 종료
             if val_loss_avg < best_val_loss:
                 best_val_loss = val_loss_avg
                 epochs_without_improvement = 0
                 os.makedirs("./saved_models", exist_ok=True)
-                torch.save(generator.module.state_dict(), "./saved_models/best_generator.pth")
-                torch.save(discriminator.module.state_dict(), "./saved_models/best_discriminator.pth")
+                # FSDP 모델의 state_dict 저장
+                torch.save(generator.state_dict(), "./saved_models/best_generator.pth")
+                torch.save(discriminator.state_dict(), "./saved_models/best_discriminator.pth")
                 print(f"Best model saved with validation loss: {best_val_loss:.4f}")
             else:
                 epochs_without_improvement += 1
                 print(f"No improvement for {epochs_without_improvement} epochs.")
 
-    # Cleanup
+    # 프로세스 그룹 종료
     dist.destroy_process_group()
 
     if rank == 0:
-        # Only the main process performs testing and saving results
-        test_and_save_results(generator.module, device)
+        # 메인 프로세스만 테스트 및 결과 저장 수행
+        test_and_save_results(device)
 
-def test_and_save_results(generator, device):
-    # Testing and saving results
+def test_and_save_results(device):
+    # 테스트 및 결과 저장
     submission_dir = "./data/submission"
     os.makedirs(submission_dir, exist_ok=True)
 
+    # 최적의 모델 로드
+    generator = UNetGenerator().to(device)
+    # 로딩을 위해 FSDP로 래핑
+    fsdp_kwargs = dict(
+        mixed_precision=MixedPrecision(
+            param_dtype=torch.float16,    # 파라미터를 fp16으로
+            reduce_dtype=torch.float16,   # reduce를 fp16으로
+            buffer_dtype=torch.float16    # 버퍼를 fp16으로
+        ),
+        device_id=torch.cuda.current_device(),
+        forward_prefetch=True
+    )
+    generator = FSDP(generator, **fsdp_kwargs)
+    generator.load_state_dict(torch.load("./saved_models/best_generator.pth"))
+    generator.eval()
+
     def load_image(image_path):
         image = Image.open(image_path).convert("RGB")
-        image = transforms.Resize((256, 256))(image)
-        image = transforms.ToTensor()(image)
-        image = transforms.Normalize([0.5]*3, [0.5]*3)(image)
+        image = transform(image)
         image = image.unsqueeze(0)
         return image
 
-    generator.eval()
-
     test_images = sorted(os.listdir(test_dir))
 
-    # Progress bar for testing
+    # 테스트 진행 상황 표시
     test_bar = tqdm(test_images, desc="Testing", leave=False)
 
     for image_name in test_bar:
@@ -421,7 +453,7 @@ def test_and_save_results(generator, device):
             with torch.cuda.amp.autocast():
                 pred_image = generator(test_image)
             pred_image = pred_image.cpu().squeeze(0)
-            pred_image = pred_image * 0.5 + 0.5  # Denormalize
+            pred_image = pred_image * 0.5 + 0.5  # 역정규화
             pred_image = pred_image.numpy().transpose(1, 2, 0)
             pred_image = (pred_image * 255).astype('uint8')
             pred_image_resized = cv2.resize(
@@ -433,8 +465,8 @@ def test_and_save_results(generator, device):
 
     print(f"Saved all images to {submission_dir}")
 
-    # Create submission ZIP file
-    zip_filename = "./data/submission_DDP.zip"
+    # 제출 ZIP 파일 생성
+    zip_filename = "./data/submission_FSDP.zip"
     with zipfile.ZipFile(zip_filename, 'w') as submission_zip:
         for image_name in test_images:
             image_path = os.path.join(submission_dir, image_name)
