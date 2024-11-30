@@ -1,6 +1,7 @@
 import os
 import random
 import zipfile
+import warnings
 
 import cv2
 import numpy as np
@@ -12,15 +13,21 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import transforms
 from tqdm import tqdm
 
+# Suppress warnings for better log readability
+warnings.filterwarnings("ignore")
+
+# Set CUDA devices for parallel processing (GPUs 0 and 1)
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+
 # Set device
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
 # Configuration
 CFG = {
-    'EPOCHS': 10,
+    'EPOCHS': 100,
     'LEARNING_RATE': 3e-4,
-    'BATCH_SIZE': 16,
+    'BATCH_SIZE': 32,
     'SEED': 42
 }
 
@@ -32,6 +39,8 @@ def seed_everything(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
+    # Enable benchmark mode for faster training (can lead to non-determinism)
+    torch.backends.cudnn.benchmark = True
 
 seed_everything(CFG['SEED'])
 
@@ -82,18 +91,24 @@ transform = transforms.Compose([
     transforms.Resize((256, 256)),
     transforms.RandomHorizontalFlip(),
     transforms.ToTensor(),
-    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+    transforms.Normalize([0.5]*3, [0.5]*3)
 ])
 
-# Create dataset and split into train and validation
+# Create dataset and split into train and validation sets
 full_dataset = CustomDataset(damage_dir=damage_dir, origin_dir=origin_dir, transform=transform)
 train_size = int(0.8 * len(full_dataset))
 val_size = len(full_dataset) - train_size
-train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size],
-                                          generator=torch.Generator().manual_seed(CFG['SEED']))
+train_dataset, val_dataset = random_split(
+    full_dataset, [train_size, val_size],
+    generator=torch.Generator().manual_seed(CFG['SEED'])
+)
 
-train_loader = DataLoader(train_dataset, batch_size=CFG['BATCH_SIZE'], shuffle=True, num_workers=4)
-val_loader = DataLoader(val_dataset, batch_size=CFG['BATCH_SIZE'], shuffle=False, num_workers=4)
+train_loader = DataLoader(
+    train_dataset, batch_size=CFG['BATCH_SIZE'], shuffle=True, num_workers=4, pin_memory=True
+)
+val_loader = DataLoader(
+    val_dataset, batch_size=CFG['BATCH_SIZE'], shuffle=False, num_workers=4, pin_memory=True
+)
 
 # U-Net Generator
 class UNetGenerator(nn.Module):
@@ -108,13 +123,16 @@ class UNetGenerator(nn.Module):
             return nn.Sequential(*layers)
 
         def up_block(in_feat, out_feat, dropout=0.0):
-            layers = [nn.ConvTranspose2d(in_feat, out_feat, kernel_size=4, stride=2, padding=1),
-                      nn.BatchNorm2d(out_feat),
-                      nn.ReLU(inplace=True)]
+            layers = [
+                nn.ConvTranspose2d(in_feat, out_feat, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm2d(out_feat),
+                nn.ReLU(inplace=True)
+            ]
             if dropout:
                 layers.append(nn.Dropout(dropout))
             return nn.Sequential(*layers)
 
+        # Define the layers of the generator
         self.down1 = down_block(in_channels, 64, normalize=False)
         self.down2 = down_block(64, 128)
         self.down3 = down_block(128, 256)
@@ -137,14 +155,14 @@ class UNetGenerator(nn.Module):
         )
 
     def forward(self, x):
-        d1 = self.down1(x)
-        d2 = self.down2(d1)
-        d3 = self.down3(d2)
-        d4 = self.down4(d3)
-        d5 = self.down5(d4)
-        d6 = self.down6(d5)
-        d7 = self.down7(d6)
-        d8 = self.down8(d7)
+        d1 = self.down1(x)  # 64
+        d2 = self.down2(d1)  # 128
+        d3 = self.down3(d2)  # 256
+        d4 = self.down4(d3)  # 512
+        d5 = self.down5(d4)  # 512
+        d6 = self.down6(d5)  # 512
+        d7 = self.down7(d6)  # 512
+        d8 = self.down8(d7)  # 512
 
         u1 = self.up1(d8)
         u2 = self.up2(torch.cat([u1, d7], 1))
@@ -163,12 +181,15 @@ class PatchGANDiscriminator(nn.Module):
         super(PatchGANDiscriminator, self).__init__()
 
         def discriminator_block(in_filters, out_filters, normalization=True):
-            layers = [nn.Conv2d(in_filters, out_filters, kernel_size=4, stride=2, padding=1)]
+            layers = [
+                nn.Conv2d(in_filters, out_filters, kernel_size=4, stride=2, padding=1)
+            ]
             if normalization:
                 layers.append(nn.BatchNorm2d(out_filters))
             layers.append(nn.LeakyReLU(0.2, inplace=True))
             return nn.Sequential(*layers)
 
+        # Define the layers of the discriminator
         self.model = nn.Sequential(
             discriminator_block(in_channels * 2, 64, normalization=False),
             discriminator_block(64, 128),
@@ -185,24 +206,47 @@ class PatchGANDiscriminator(nn.Module):
 def weights_init_normal(m):
     classname = m.__class__.__name__
     if classname.find('Conv') != -1:
-        torch.nn.init.normal_(m.weight.data, 0.0, 0.02)
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
     elif classname.find('BatchNorm2d') != -1:
-        torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
-        torch.nn.init.constant_(m.bias.data, 0.0)
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.constant_(m.bias.data, 0.0)
 
-generator = UNetGenerator().to(device)
-discriminator = PatchGANDiscriminator().to(device)
+generator = UNetGenerator()
+discriminator = PatchGANDiscriminator()
 
 generator.apply(weights_init_normal)
 discriminator.apply(weights_init_normal)
 
+# Wrap models with DataParallel for multi-GPU usage
+generator = nn.DataParallel(generator)
+discriminator = nn.DataParallel(discriminator)
+
+generator.to(device)
+discriminator.to(device)
+
 criterion_GAN = nn.MSELoss()
 criterion_pixelwise = nn.L1Loss()
 
-optimizer_G = optim.Adam(generator.parameters(), lr=CFG["LEARNING_RATE"], betas=(0.5, 0.999))
-optimizer_D = optim.Adam(discriminator.parameters(), lr=CFG["LEARNING_RATE"], betas=(0.5, 0.999))
+optimizer_G = optim.Adam(
+    generator.parameters(), lr=CFG["LEARNING_RATE"], betas=(0.5, 0.999)
+)
+optimizer_D = optim.Adam(
+    discriminator.parameters(), lr=CFG["LEARNING_RATE"], betas=(0.5, 0.999)
+)
 
-# Update: Use torch.amp instead of torch.cuda.amp
+# Learning rate schedulers
+scheduler_G = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer_G, mode='min', factor=0.5, patience=5, verbose=True
+)
+scheduler_D = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer_D, mode='min', factor=0.5, patience=5, verbose=True
+)
+
+# Early stopping parameters
+early_stopping_patience = 10
+epochs_without_improvement = 0
+
+# Mixed precision scaler
 scaler_G = torch.amp.GradScaler()
 scaler_D = torch.amp.GradScaler()
 
@@ -211,6 +255,10 @@ best_val_loss = float("inf")
 lambda_pixel = 100
 
 for epoch in range(1, CFG['EPOCHS'] + 1):
+    if epochs_without_improvement >= early_stopping_patience:
+        print("Early stopping triggered.")
+        break
+
     generator.train()
     discriminator.train()
     total_G_loss = 0
@@ -220,8 +268,8 @@ for epoch in range(1, CFG['EPOCHS'] + 1):
     train_bar = tqdm(train_loader, desc="Training", leave=False)
 
     for i, batch in enumerate(train_bar):
-        real_A = batch['A'].to(device)
-        real_B = batch['B'].to(device)
+        real_A = batch['A'].to(device, non_blocking=True)
+        real_B = batch['B'].to(device, non_blocking=True)
 
         # ------------------
         #  Train Generator
@@ -230,7 +278,7 @@ for epoch in range(1, CFG['EPOCHS'] + 1):
         with torch.amp.autocast(device_type='cuda'):
             fake_B = generator(real_A)
             pred_fake = discriminator(fake_B, real_A)
-            valid = torch.ones_like(pred_fake, device=device)
+            valid = torch.ones_like(pred_fake, device=device, requires_grad=False)
             loss_GAN = criterion_GAN(pred_fake, valid)
             loss_pixel = criterion_pixelwise(fake_B, real_B)
             loss_G = loss_GAN + lambda_pixel * loss_pixel
@@ -245,11 +293,11 @@ for epoch in range(1, CFG['EPOCHS'] + 1):
         optimizer_D.zero_grad()
         with torch.amp.autocast(device_type='cuda'):
             pred_real = discriminator(real_B, real_A)
-            valid = torch.ones_like(pred_real, device=device)
+            valid = torch.ones_like(pred_real, device=device, requires_grad=False)
             loss_real = criterion_GAN(pred_real, valid)
 
             pred_fake = discriminator(fake_B.detach(), real_A)
-            fake = torch.zeros_like(pred_fake, device=device)
+            fake = torch.zeros_like(pred_fake, device=device, requires_grad=False)
             loss_fake = criterion_GAN(pred_fake, fake)
 
             loss_D = 0.5 * (loss_real + loss_fake)
@@ -268,10 +316,13 @@ for epoch in range(1, CFG['EPOCHS'] + 1):
             'G_loss': f'{loss_G.item():.4f}'
         })
 
-    # Step-by-step logging after each epoch
+    # Logging after each epoch
     avg_G_loss = total_G_loss / len(train_loader)
     avg_D_loss = total_D_loss / len(train_loader)
-    print(f"Epoch [{epoch}/{CFG['EPOCHS']}], Generator Loss: {avg_G_loss:.4f}, Discriminator Loss: {avg_D_loss:.4f}")
+    print(
+        f"Epoch [{epoch}/{CFG['EPOCHS']}], "
+        f"Generator Loss: {avg_G_loss:.4f}, Discriminator Loss: {avg_D_loss:.4f}"
+    )
 
     # Validation
     generator.eval()
@@ -279,8 +330,8 @@ for epoch in range(1, CFG['EPOCHS'] + 1):
     val_bar = tqdm(val_loader, desc="Validation", leave=False)
     with torch.no_grad():
         for batch in val_bar:
-            real_A = batch['A'].to(device)
-            real_B = batch['B'].to(device)
+            real_A = batch['A'].to(device, non_blocking=True)
+            real_B = batch['B'].to(device, non_blocking=True)
             with torch.amp.autocast(device_type='cuda'):
                 fake_B = generator(real_A)
                 loss_pixel = criterion_pixelwise(fake_B, real_B)
@@ -292,16 +343,24 @@ for epoch in range(1, CFG['EPOCHS'] + 1):
     val_loss /= len(val_loader)
     print(f"Validation Loss: {val_loss:.4f}")
 
-    # Save the model with the lowest validation loss
+    # Step schedulers
+    scheduler_G.step(val_loss)
+    scheduler_D.step(val_loss)
+
+    # Early stopping
     if val_loss < best_val_loss:
         best_val_loss = val_loss
+        epochs_without_improvement = 0
         os.makedirs("./saved_models", exist_ok=True)
         torch.save(generator.state_dict(), "./saved_models/best_generator.pth")
         torch.save(discriminator.state_dict(), "./saved_models/best_discriminator.pth")
         print(f"Best model saved with validation loss: {best_val_loss:.4f}")
+    else:
+        epochs_without_improvement += 1
+        print(f"No improvement for {epochs_without_improvement} epochs.")
 
 # Testing and saving results
-submission_dir = "../data/submission"
+submission_dir = "./data/submission"
 os.makedirs(submission_dir, exist_ok=True)
 
 def load_image(image_path):
@@ -326,10 +385,12 @@ for image_name in test_bar:
         with torch.amp.autocast(device_type='cuda'):
             pred_image = generator(test_image)
         pred_image = pred_image.cpu().squeeze(0)
-        pred_image = pred_image * 0.5 + 0.5
+        pred_image = pred_image * 0.5 + 0.5  # Denormalize
         pred_image = pred_image.numpy().transpose(1, 2, 0)
         pred_image = (pred_image * 255).astype('uint8')
-        pred_image_resized = cv2.resize(pred_image, (512, 512), interpolation=cv2.INTER_LINEAR)
+        pred_image_resized = cv2.resize(
+            pred_image, (512, 512), interpolation=cv2.INTER_LINEAR
+        )
 
     output_path = os.path.join(submission_dir, image_name)
     cv2.imwrite(output_path, cv2.cvtColor(pred_image_resized, cv2.COLOR_RGB2BGR))
@@ -337,7 +398,7 @@ for image_name in test_bar:
 print(f"Saved all images to {submission_dir}")
 
 # Create submission ZIP file
-zip_filename = "./data/submission_base.zip"
+zip_filename = "./data/submission_advenced.zip"
 with zipfile.ZipFile(zip_filename, 'w') as submission_zip:
     for image_name in test_images:
         image_path = os.path.join(submission_dir, image_name)
