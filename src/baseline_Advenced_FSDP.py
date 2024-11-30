@@ -277,23 +277,27 @@ def train(rank, world_size):
     # 조기 종료 설정
     early_stopping_patience = CFG['PATIENCE']
     epochs_without_improvement = 0
+    best_val_loss = float("inf")  # 여기에 best_val_loss 초기화 추가
 
     # 혼합 정밀도 스케일러
     scaler_G = ShardedGradScaler()
     scaler_D = ShardedGradScaler()
 
     # 학습 루프 및 검증
-    best_val_loss = float("inf")
     lambda_pixel = 100
 
-    for epoch in range(1, CFG['EPOCHS'] + 1):
+    # tqdm로 에포크 진행 상황 표시
+    for epoch in tqdm(range(1, CFG['EPOCHS'] + 1), desc="Epochs", disable=(rank != 0)):
+
+        # 조기 종료 조건 만족 시 모든 프로세스에서 학습 루프 종료
         if epochs_without_improvement >= early_stopping_patience:
             if rank == 0:
                 print("조기 종료가 발동되었습니다.")
-            break
+            break  # 모든 프로세스에서 break
 
         # 에포크마다 샘플러 설정
         train_sampler.set_epoch(epoch)
+        val_sampler.set_epoch(epoch)  # val_sampler도 설정
 
         generator.train()
         discriminator.train()
@@ -303,7 +307,7 @@ def train(rank, world_size):
         if rank == 0:
             print(f"\nEpoch [{epoch}/{CFG['EPOCHS']}]")
 
-        train_bar = tqdm(train_loader, desc=f"Training Rank {rank}", leave=False, disable=(rank != 0))
+        train_bar = tqdm(train_loader, desc=f"Training", leave=False, disable=(rank != 0))
 
         for i, batch in enumerate(train_bar):
             real_A = batch['A'].to(device, non_blocking=True)
@@ -369,7 +373,7 @@ def train(rank, world_size):
         generator.eval()
         val_loss = 0
         with torch.no_grad():
-            val_bar = tqdm(val_loader, desc=f"Validation Rank {rank}", leave=False, disable=(rank != 0))
+            val_bar = tqdm(val_loader, desc=f"Validation", leave=False, disable=(rank != 0))
             for batch in val_bar:
                 real_A = batch['A'].to(device, non_blocking=True)
                 real_B = batch['B'].to(device, non_blocking=True)
@@ -405,6 +409,27 @@ def train(rank, world_size):
             else:
                 epochs_without_improvement += 1
                 print(f"No improvement for {epochs_without_improvement} epochs.")
+
+            # 동기화 시작 로그
+            print("Synchronizing variables across processes...")
+
+        # --- 변수 동기화 ---
+        # epochs_without_improvement와 best_val_loss를 텐서로 변환
+        epochs_without_improvement_tensor = torch.tensor(epochs_without_improvement, device=device)
+        best_val_loss_tensor = torch.tensor(best_val_loss, device=device)
+
+        # Rank 0에서 다른 프로세스로 브로드캐스트
+        dist.broadcast(epochs_without_improvement_tensor, src=0)
+        dist.broadcast(best_val_loss_tensor, src=0)
+
+        # 다른 프로세스에서 변수 업데이트
+        if rank != 0:
+            epochs_without_improvement = epochs_without_improvement_tensor.item()
+            best_val_loss = best_val_loss_tensor.item()
+
+        if rank == 0:
+            # 동기화 완료 로그
+            print("Variables synchronized.")
 
     # 프로세스 그룹 종료
     dist.destroy_process_group()
