@@ -20,13 +20,13 @@ warnings.filterwarnings("ignore")
 
 # Configuration
 CFG = {
-    'EPOCHS': 100,
+    'EPOCHS': 30,
     'LEARNING_RATE': 3e-4,
     'BATCH_SIZE': 32,
     'SEED': 42,
     'WORLD_SIZE': torch.cuda.device_count(),  # Number of GPUs available
     'NUM_WORKERS': 4,
-    'PATIENCE': 10
+    'PATIENCE': 5
 }
 
 # Seed setting
