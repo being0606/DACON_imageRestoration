@@ -257,20 +257,22 @@ def train(rank, world_size):
     # Early stopping parameters
     early_stopping_patience = CFG['PATIENCE']
     epochs_without_improvement = 0
+    best_val_loss = float("inf")  # 초기화 위치 수정
 
     # Mixed precision scaler
     scaler_G = torch.cuda.amp.GradScaler()
     scaler_D = torch.cuda.amp.GradScaler()
 
     # Training loop with validation
-    best_val_loss = float("inf")
     lambda_pixel = 100
 
     for epoch in range(1, CFG['EPOCHS'] + 1):
+
+        # 조기 종료 조건 만족 시 모든 프로세스에서 학습 루프 종료
         if epochs_without_improvement >= early_stopping_patience:
             if rank == 0:
                 print("Early stopping triggered.")
-            break
+            break  # 모든 프로세스에서 break
 
         # Set samplers epoch for shuffling
         train_sampler.set_epoch(epoch)
@@ -385,6 +387,20 @@ def train(rank, world_size):
             else:
                 epochs_without_improvement += 1
                 print(f"No improvement for {epochs_without_improvement} epochs.")
+
+        # --- 변수 동기화 추가 ---
+        # epochs_without_improvement와 best_val_loss를 텐서로 변환
+        epochs_without_improvement_tensor = torch.tensor(epochs_without_improvement, device=device)
+        best_val_loss_tensor = torch.tensor(best_val_loss, device=device)
+
+        # Rank 0에서 다른 프로세스로 브로드캐스트
+        dist.broadcast(epochs_without_improvement_tensor, src=0)
+        dist.broadcast(best_val_loss_tensor, src=0)
+
+        # 다른 프로세스에서 변수 업데이트
+        if rank != 0:
+            epochs_without_improvement = epochs_without_improvement_tensor.item()
+            best_val_loss = best_val_loss_tensor.item()
 
     # Cleanup
     dist.destroy_process_group()
