@@ -102,6 +102,9 @@ def main():
     mp.spawn(train, args=(CFG['WORLD_SIZE'],), nprocs=CFG['WORLD_SIZE'], join=True)
 
 def train(rank, world_size):
+    # Enable anomaly detection for debugging
+    torch.autograd.set_detect_anomaly(True)
+
     # Initialize the process group
     dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
     torch.cuda.set_device(rank)
@@ -139,14 +142,15 @@ def train(rank, world_size):
                 layers = [nn.Conv2d(in_feat, out_feat, kernel_size=4, stride=2, padding=1)]
                 if normalize:
                     layers.append(nn.BatchNorm2d(out_feat))
-                layers.append(nn.LeakyReLU(0.2, inplace=True))
+                # 변경: inplace=False
+                layers.append(nn.LeakyReLU(0.2, inplace=False))
                 return nn.Sequential(*layers)
 
             def up_block(in_feat, out_feat, dropout=0.0):
                 layers = [
                     nn.ConvTranspose2d(in_feat, out_feat, kernel_size=4, stride=2, padding=1),
                     nn.BatchNorm2d(out_feat),
-                    nn.ReLU(inplace=True)
+                    nn.ReLU(inplace=False)  # 변경: inplace=False
                 ]
                 if dropout:
                     layers.append(nn.Dropout(dropout))
@@ -206,7 +210,8 @@ def train(rank, world_size):
                 ]
                 if normalization:
                     layers.append(nn.BatchNorm2d(out_filters))
-                layers.append(nn.LeakyReLU(0.2, inplace=True))
+                # 변경: inplace=False
+                layers.append(nn.LeakyReLU(0.2, inplace=False))
                 return nn.Sequential(*layers)
 
             # Define the layers of the discriminator
@@ -422,7 +427,7 @@ def train(rank, world_size):
 
     if rank == 0:
         # Only the main process performs testing and saving results
-            test_and_save_results(generator.module, device)
+        test_and_save_results(generator.module, device)
 
 def test_and_save_results(generator, device):
     # Testing and saving results
