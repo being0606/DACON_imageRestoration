@@ -29,6 +29,11 @@ CFG = {
     'PATIENCE': 5
 }
 
+# Data directories (전역 변수로 설정)
+origin_dir = './data/train_gt'
+damage_dir = './data/train_input'
+test_dir = './data/test_input'
+
 # Seed setting
 def seed_everything(seed):
     random.seed(seed)
@@ -39,13 +44,6 @@ def seed_everything(seed):
     # Deterministic algorithms can have performance implications
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-seed_everything(CFG['SEED'])
-
-# Data directories
-origin_dir = './data/train_gt'
-damage_dir = './data/train_input'
-test_dir = './data/test_input'
 
 # Custom dataset with consistent transformations
 class CustomDataset(Dataset):
@@ -93,6 +91,13 @@ transform = transforms.Compose([
 ])
 
 def main():
+    # Ensure MASTER_ADDR and MASTER_PORT are set
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+
+    # Seed everything for the main process
+    seed_everything(CFG['SEED'])
+
     # Spawn processes
     mp.spawn(train, args=(CFG['WORLD_SIZE'],), nprocs=CFG['WORLD_SIZE'], join=True)
 
@@ -233,8 +238,8 @@ def train(rank, world_size):
     discriminator.apply(weights_init_normal)
 
     # Wrap models with DistributedDataParallel
-    generator = nn.parallel.DistributedDataParallel(generator, device_ids=[rank])
-    discriminator = nn.parallel.DistributedDataParallel(discriminator, device_ids=[rank])
+    generator = nn.parallel.DistributedDataParallel(generator, device_ids=[rank], output_device=rank)
+    discriminator = nn.parallel.DistributedDataParallel(discriminator, device_ids=[rank], output_device=rank)
 
     criterion_GAN = nn.MSELoss().to(device)
     criterion_pixelwise = nn.L1Loss().to(device)
@@ -266,148 +271,158 @@ def train(rank, world_size):
     # Training loop with validation
     lambda_pixel = 100
 
-    for epoch in range(1, CFG['EPOCHS'] + 1):
+    for epoch in tqdm(range(1, CFG['EPOCHS'] + 1), desc=f"Epoch {rank}", position=rank):
+        try:
+            # Early stopping condition check
+            if epochs_without_improvement >= early_stopping_patience:
+                if rank == 0:
+                    print("Early stopping triggered.")
+                # Broadcast a flag to other ranks to break the loop
+                stop_flag = torch.tensor(0, dtype=torch.int, device=device)  # 0 means stop
+                dist.broadcast(stop_flag, src=0)
+                break
 
-        # 조기 종료 조건 만족 시 모든 프로세스에서 학습 루프 종료
-        if epochs_without_improvement >= early_stopping_patience:
-            if rank == 0:
-                print("Early stopping triggered.")
-            break  # 모든 프로세스에서 break
+            # Set samplers epoch for shuffling
+            train_sampler.set_epoch(epoch)
+            val_sampler.set_epoch(epoch)  # Not strictly necessary for val_sampler
 
-        # Set samplers epoch for shuffling
-        train_sampler.set_epoch(epoch)
-        val_sampler.set_epoch(epoch)  # Not strictly necessary for val_sampler
-
-        generator.train()
-        discriminator.train()
-        total_G_loss = 0
-        total_D_loss = 0
-
-        if rank == 0:
-            print(f"\nEpoch [{epoch}/{CFG['EPOCHS']}]")
-
-        train_bar = tqdm(train_loader, desc=f"Training Rank {rank}", leave=False, disable=(rank != 0))
-
-        for i, batch in enumerate(train_bar):
-            real_A = batch['A'].to(device, non_blocking=True)
-            real_B = batch['B'].to(device, non_blocking=True)
-
-            # ------------------
-            #  Train Generator
-            # ------------------
-            optimizer_G.zero_grad()
-            with torch.cuda.amp.autocast():
-                fake_B = generator(real_A)
-                pred_fake = discriminator(fake_B, real_A)
-                valid = torch.ones_like(pred_fake, device=device, requires_grad=False)
-                loss_GAN = criterion_GAN(pred_fake, valid)
-                loss_pixel = criterion_pixelwise(fake_B, real_B)
-                loss_G = loss_GAN + lambda_pixel * loss_pixel
-
-            scaler_G.scale(loss_G).backward()
-            scaler_G.step(optimizer_G)
-            scaler_G.update()
-
-            # ---------------------
-            #  Train Discriminator
-            # ---------------------
-            optimizer_D.zero_grad()
-            with torch.cuda.amp.autocast():
-                pred_real = discriminator(real_B, real_A)
-                valid = torch.ones_like(pred_real, device=device, requires_grad=False)
-                loss_real = criterion_GAN(pred_real, valid)
-
-                pred_fake = discriminator(fake_B.detach(), real_A)
-                fake = torch.zeros_like(pred_fake, device=device, requires_grad=False)
-                loss_fake = criterion_GAN(pred_fake, fake)
-
-                loss_D = 0.5 * (loss_real + loss_fake)
-
-            scaler_D.scale(loss_D).backward()
-            scaler_D.step(optimizer_D)
-            scaler_D.update()
-
-            total_G_loss += loss_G.item()
-            total_D_loss += loss_D.item()
+            generator.train()
+            discriminator.train()
+            total_G_loss = 0.0
+            total_D_loss = 0.0
 
             if rank == 0:
-                # Update progress bar
-                train_bar.set_postfix({
-                    'Batch': f'{i}/{len(train_loader)}',
-                    'D_loss': f'{loss_D.item():.4f}',
-                    'G_loss': f'{loss_G.item():.4f}'
-                })
+                print(f"\nEpoch [{epoch}/{CFG['EPOCHS']}]")
 
-        # Average the losses across all processes
-        total_G_loss_tensor = torch.tensor(total_G_loss, device=device)
-        total_D_loss_tensor = torch.tensor(total_D_loss, device=device)
-
-        dist.all_reduce(total_G_loss_tensor, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_D_loss_tensor, op=dist.ReduceOp.SUM)
-
-        avg_G_loss = total_G_loss_tensor.item() / (len(train_loader) * world_size)
-        avg_D_loss = total_D_loss_tensor.item() / (len(train_loader) * world_size)
-
-        # Gather validation loss from all processes
-        generator.eval()
-        val_loss = 0
-        with torch.no_grad():
-            val_bar = tqdm(val_loader, desc=f"Validation Rank {rank}", leave=False, disable=(rank != 0))
-            for batch in val_bar:
+            # Training loop with tqdm
+            train_bar = tqdm(train_loader, desc=f"Training Rank {rank}", leave=False, position=rank)
+            for i, batch in enumerate(train_bar):
                 real_A = batch['A'].to(device, non_blocking=True)
                 real_B = batch['B'].to(device, non_blocking=True)
+
+                # ------------------
+                #  Train Generator
+                # ------------------
+                optimizer_G.zero_grad()
                 with torch.cuda.amp.autocast():
                     fake_B = generator(real_A)
+                    pred_fake = discriminator(fake_B, real_A)
+                    valid = torch.ones_like(pred_fake, device=device, requires_grad=False)
+                    loss_GAN = criterion_GAN(pred_fake, valid)
                     loss_pixel = criterion_pixelwise(fake_B, real_B)
-                val_loss += loss_pixel.item()
+                    loss_G = loss_GAN + lambda_pixel * loss_pixel
 
-        # Reduce val_loss across all processes
-        val_loss_tensor = torch.tensor(val_loss, device=device)
-        dist.reduce(val_loss_tensor, dst=0, op=dist.ReduceOp.SUM)
-        total_val_loss = val_loss_tensor.item()
+                scaler_G.scale(loss_G).backward()
+                scaler_G.step(optimizer_G)
+                scaler_G.update()
 
-        if rank == 0:
-            val_loss_avg = total_val_loss / (len(val_loader) * world_size)
-            print(f"Epoch [{epoch}/{CFG['EPOCHS']}], "
-                  f"Generator Loss: {avg_G_loss:.4f}, Discriminator Loss: {avg_D_loss:.4f}")
-            print(f"Validation Loss: {val_loss_avg:.4f}")
+                # ---------------------
+                #  Train Discriminator
+                # ---------------------
+                optimizer_D.zero_grad()
+                with torch.cuda.amp.autocast():
+                    pred_real = discriminator(real_B, real_A)
+                    valid = torch.ones_like(pred_real, device=device, requires_grad=False)
+                    loss_real = criterion_GAN(pred_real, valid)
 
-            # Step schedulers
-            scheduler_G.step(val_loss_avg)
-            scheduler_D.step(val_loss_avg)
+                    pred_fake = discriminator(fake_B.detach(), real_A)
+                    fake = torch.zeros_like(pred_fake, device=device, requires_grad=False)
+                    loss_fake = criterion_GAN(pred_fake, fake)
 
-            # Early stopping
-            if val_loss_avg < best_val_loss:
-                best_val_loss = val_loss_avg
-                epochs_without_improvement = 0
-                os.makedirs("./saved_models", exist_ok=True)
-                torch.save(generator.module.state_dict(), "./saved_models/best_generator.pth")
-                torch.save(discriminator.module.state_dict(), "./saved_models/best_discriminator.pth")
-                print(f"Best model saved with validation loss: {best_val_loss:.4f}")
-            else:
-                epochs_without_improvement += 1
-                print(f"No improvement for {epochs_without_improvement} epochs.")
+                    loss_D = 0.5 * (loss_real + loss_fake)
 
-        # --- 변수 동기화 추가 ---
-        # epochs_without_improvement와 best_val_loss를 텐서로 변환
-        epochs_without_improvement_tensor = torch.tensor(epochs_without_improvement, device=device)
-        best_val_loss_tensor = torch.tensor(best_val_loss, device=device)
+                scaler_D.scale(loss_D).backward()
+                scaler_D.step(optimizer_D)
+                scaler_D.update()
 
-        # Rank 0에서 다른 프로세스로 브로드캐스트
-        dist.broadcast(epochs_without_improvement_tensor, src=0)
-        dist.broadcast(best_val_loss_tensor, src=0)
+                total_G_loss += loss_G.item()
+                total_D_loss += loss_D.item()
 
-        # 다른 프로세스에서 변수 업데이트
-        if rank != 0:
-            epochs_without_improvement = epochs_without_improvement_tensor.item()
-            best_val_loss = best_val_loss_tensor.item()
+                if rank == 0:
+                    # Update progress bar
+                    train_bar.set_postfix({
+                        'Batch': f'{i}/{len(train_loader)}',
+                        'D_loss': f'{loss_D.item():.4f}',
+                        'G_loss': f'{loss_G.item():.4f}'
+                    })
+
+            # Average the losses across all processes
+            total_G_loss_tensor = torch.tensor(total_G_loss, device=device)
+            total_D_loss_tensor = torch.tensor(total_D_loss, device=device)
+
+            dist.all_reduce(total_G_loss_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_D_loss_tensor, op=dist.ReduceOp.SUM)
+
+            avg_G_loss = total_G_loss_tensor.item() / (len(train_loader) * world_size)
+            avg_D_loss = total_D_loss_tensor.item() / (len(train_loader) * world_size)
+
+            # Validation
+            generator.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                val_bar = tqdm(val_loader, desc=f"Validation Rank {rank}", leave=False, position=rank)
+                for batch in val_bar:
+                    real_A = batch['A'].to(device, non_blocking=True)
+                    real_B = batch['B'].to(device, non_blocking=True)
+                    with torch.cuda.amp.autocast():
+                        fake_B = generator(real_A)
+                        loss_pixel = criterion_pixelwise(fake_B, real_B)
+                    val_loss += loss_pixel.item()
+
+            # Reduce val_loss across all processes
+            val_loss_tensor = torch.tensor(val_loss, device=device)
+            dist.reduce(val_loss_tensor, dst=0, op=dist.ReduceOp.SUM)
+            total_val_loss = val_loss_tensor.item()
+
+            if rank == 0:
+                val_loss_avg = total_val_loss / (len(val_loader) * world_size)
+                print(f"Epoch [{epoch}/{CFG['EPOCHS']}], "
+                        f"Generator Loss: {avg_G_loss:.4f}, Discriminator Loss: {avg_D_loss:.4f}")
+                print(f"Validation Loss: {val_loss_avg:.4f}")
+
+                # Step schedulers
+                scheduler_G.step(val_loss_avg)
+                scheduler_D.step(val_loss_avg)
+
+                # Early stopping
+                if val_loss_avg < best_val_loss:
+                    best_val_loss = val_loss_avg
+                    epochs_without_improvement = 0
+                    os.makedirs("./saved_models", exist_ok=True)
+                    torch.save(generator.module.state_dict(), "./saved_models/best_generator.pth")
+                    torch.save(discriminator.module.state_dict(), "./saved_models/best_discriminator.pth")
+                    print(f"Best model saved with validation loss: {best_val_loss:.4f}")
+                else:
+                    epochs_without_improvement += 1
+                    print(f"No improvement for {epochs_without_improvement} epochs.")
+
+                    if epochs_without_improvement >= early_stopping_patience:
+                        print("Early stopping will be triggered in the next epoch.")
+
+            # --- 변수 동기화 추가 ---
+            # epochs_without_improvement와 best_val_loss를 텐서로 변환
+            epochs_without_improvement_tensor = torch.tensor(epochs_without_improvement, device=device)
+            best_val_loss_tensor = torch.tensor(best_val_loss, device=device)
+
+            # Rank 0에서 다른 프로세스로 브로드캐스트
+            dist.broadcast(epochs_without_improvement_tensor, src=0)
+            dist.broadcast(best_val_loss_tensor, src=0)
+
+            # 다른 프로세스에서 변수 업데이트
+            if rank != 0:
+                epochs_without_improvement = epochs_without_improvement_tensor.item()
+                best_val_loss = best_val_loss_tensor.item()
+
+        except Exception as e:
+            print(f"[Rank {rank}] Exception occurred: {e}")
+            break
 
     # Cleanup
     dist.destroy_process_group()
 
     if rank == 0:
         # Only the main process performs testing and saving results
-        test_and_save_results(generator.module, device)
+            test_and_save_results(generator.module, device)
 
 def test_and_save_results(generator, device):
     # Testing and saving results
@@ -427,7 +442,7 @@ def test_and_save_results(generator, device):
     test_images = sorted(os.listdir(test_dir))
 
     # Progress bar for testing
-    test_bar = tqdm(test_images, desc="Testing", leave=False)
+    test_bar = tqdm(test_images, desc="Testing", leave=True)
 
     for image_name in test_bar:
         test_image_path = os.path.join(test_dir, image_name)
