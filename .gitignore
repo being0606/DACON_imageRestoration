@@ -4,3 +4,4 @@ src/saved_models/best_generator.pth
 src/baseline_submission.zip
 saved_models/best_discriminator.pth
 saved_models/best_generator.pth
+checkpoint.pth

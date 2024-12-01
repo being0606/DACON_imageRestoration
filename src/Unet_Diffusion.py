@@ -2,6 +2,9 @@ import os
 import random
 import zipfile
 
+import warnings
+warnings.filterwarnings("ignore")
+
 import cv2
 import numpy as np
 import torch
@@ -21,7 +24,7 @@ print("Using device:", device)
 
 # Configuration
 CFG = {
-    'EPOCHS': 100,
+    'EPOCHS': 30,
     'LEARNING_RATE': 1e-4,
     'BATCH_SIZE': 16,
     'SEED': 42,
@@ -67,7 +70,7 @@ class ImageDataset(Dataset):
         origin_img_path = os.path.join(self.origin_dir, origin_img_name)
 
         damage_img = Image.open(damage_img_path).convert("RGB")
-        origin_img = Image.open(origin_img_path).convert("RGB")
+        origin_img = Image.open(origin_img_path).convert("L")  # 그레이스케일로 변경
 
         if self.transform:
             # Apply the same transformation to both images
@@ -159,7 +162,6 @@ class UNet(nn.Module):
         self.up1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
         self.dec1 = conv_block(128, 64)
         self.final = nn.Conv2d(64, out_channels, kernel_size=1)
-        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
         d1 = self.down1(x)
@@ -184,7 +186,6 @@ class UNet(nn.Module):
         m1 = torch.cat([u1, d1], dim=1)
         d1 = self.dec1(m1)
         out = self.final(d1)
-        out = self.sigmoid(out)
         return out
 
 # Initialize models, optimizers, and loss functions
@@ -195,7 +196,7 @@ if torch.cuda.device_count() > 1:
     unet = nn.DataParallel(unet, device_ids=[0, 1])
 
 # Loss function
-mask_loss = nn.BCELoss()
+mask_loss = nn.BCEWithLogitsLoss()
 
 # Optimizer for U-Net
 optimizer_unet = optim.Adam(unet.parameters(), lr=CFG['LEARNING_RATE'], betas=(0.5, 0.999))
