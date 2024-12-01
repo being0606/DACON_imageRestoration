@@ -28,7 +28,7 @@ CFG = {
     'LEARNING_RATE': 1e-4,
     'BATCH_SIZE': 16,
     'SEED': 42,
-    'PATIENCE': 10
+    'PATIENCE': 5
 }
 
 # Seed setting
