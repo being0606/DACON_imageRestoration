@@ -1,3 +1,4 @@
 diffusers
 lightning
 segmentation-models-pytorch
+polygenerator
