@@ -5,3 +5,5 @@ src/baseline_submission.zip
 saved_models/best_discriminator.pth
 saved_models/best_generator.pth
 checkpoint.pth
+lightning_logs
+preproc
