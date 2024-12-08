@@ -1,1 +1,3 @@
 diffusers
+lightning
+segmentation-models-pytorch
